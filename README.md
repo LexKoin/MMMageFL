@@ -110,16 +110,16 @@ Each model is self-contained in its own directory with a dedicated README:
 ## 📝 Citation
 
 ```bibtex
-@article{yang2026magevl,
+@article{yang2026mage,
   title={Mage-VL: An Efficient Codec-Native Streaming Multimodal Foundation Model},
-  author={Yang, Senqiao and Zhang, Kaichen and Jia, Zhaoyang and Guo, Jinghao and Shen, Yifei and Zhang, Xinjie and Zhang, Xiaoyi and Wang, Haoqing and Li, Xiao and Zhang, Peng and An, Xiang and Xie, Yin and Liu, Zhening and Guo, Xun and Li, Jiahao and Zheng, Shicheng and Wang, Jinglu and Guo, Zongyu and Xie, Wenxuan and Zheng, Zihan and Luo, Yuxuan and Li, Bin and Lu, Yan},
+  author={Yang, Senqiao and Zhang, Kaichen and Jia, Zhaoyang and Guo, Jinghao and Shen, Yifei and Zhang, Xinjie and Zhang, Xiaoyi and Wang, Haoqing and Li, Xiao and Zhang, Peng and others},
   journal={arXiv preprint arXiv:2607.24904},
   year={2026}
 }
 
-@article{zhang2026mageflow,
+@article{zhang2026mage,
   title={Mage-Flow: An Efficient Native-Resolution Foundation Model for Image Generation and Editing},
-  author={Zhang, Xinjie and Zhang, Peng and Zheng, Shicheng and Guo, Jinghao and Jia, Zhaoyang and Shen, Yifei and Guo, Xun and Luo, Yuxuan and Li, Jiahao and Xie, Wenxuan and Pu, Fanyi and Zhang, Xiaoyi and Zhang, Kaichen and Guo, Zongyu and Bi, Tianci and Gui, Dongnan and Liu, Zhening and Wen, Zimo and Zheng, Zihan and Yang, Senqiao and Li, Xiao and Wang, Jinglu and Li, Bin and Lu, Yan},
+  author={Zhang, Xinjie and Zhang, Peng and Zheng, Shicheng and Guo, Jinghao and Jia, Zhaoyang and Shen, Yifei and Guo, Xun and Luo, Yuxuan and Li, Jiahao and Xie, Wenxuan and others},
   journal={arXiv preprint arXiv:2607.19064},
   year={2026}
 }
