@@ -27,8 +27,6 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 
 from .models.mage_flow import MageFlowModel, ModelConfig
 from .models.utils import PROMPT_TEMPLATE, get_noise, unpack
-from .models.modules.mage_text import make_refusal_image
-from .models.modules.mage_latent import encode_noise, resolve_gs_key
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +252,6 @@ def _slice_packed(txt_flat, vec, lens, start, count, device):
 def generate_images(model, prompts, neg_prompts=None, seeds=None, steps=30, cfg=5.0,
                     heights=None, widths=None, device="cuda",
                     prompt_template="mage-flow", static_shift=None,
-                    gs_key=None,
                     renormalization=False, batch_cfg=True):
     """Generate one image per prompt. Prompts may request DIFFERENT resolutions;
     all are packed into a single varlen forward per denoise step — samples are
@@ -275,25 +272,13 @@ def generate_images(model, prompts, neg_prompts=None, seeds=None, steps=30, cfg=
     drop_idx = int(info.get("start_idx", 0))
     dev = torch.device(device)
 
-    # Content-policy gate per sample (MANDATORY — runs on the same text-encoder
-    # weights as conditioning, no opt-out). Violating prompts get a refusal
-    # placeholder and are dropped from the pack.
+    # Resolve random seeds up front; every sample is generated.
     results = [None] * n
-    active = []
-    for i in range(n):
+    active = list(range(n))
+    for i in active:
         if seeds[i] == -1:
             seeds[i] = random.randint(0, 2**32 - 1)
-        verdict = model.txt_enc.screen_text(prompts[i])
-        if verdict.violates:
-            h_, w_ = _make_divisible_by_16(heights[i]), _make_divisible_by_16(widths[i])
-            print(verdict.banner())
-            results[i] = make_refusal_image(verdict, height=h_, width=w_)
-            continue
-        active.append(i)
-    if not active:
-        return results
 
-    gs_key_int = resolve_gs_key(gs_key)
     # Per-sample noise tokens + position ids + shapes (MageVAE: flatten, no packing).
     ch = model.vae.latent_channels
     img_list, ids_list, lens, shapes, hw = [], [], [], [], []
@@ -302,10 +287,6 @@ def generate_images(model, prompts, neg_prompts=None, seeds=None, steps=30, cfg=
         torch.manual_seed(seeds[i])
         x = get_noise(num_samples=1, channel=ch, height=h_, width=w_,
                       device=dev, dtype=torch.bfloat16, seed=seeds[i])
-        # Distribution-preserving watermark in the initial noise (same shape,
-        # still ~N(0,1)); detect by inverting the flow ODE back to noise.
-        x = encode_noise(tuple(x.shape[1:]), key=gs_key_int,
-                         seed=seeds[i], device=dev, dtype=torch.bfloat16)
         _, _, gh, gw = x.shape
         img_list.append(rearrange(x, "b c h w -> b (h w) c")[0])
         ids = torch.zeros(gh, gw, 3, device=dev)
@@ -421,7 +402,6 @@ def _encode_edits_packed(model, ref_pils_per_sample, instructions, template, dro
 def generate_edits(model, prompts, ref_images, neg_prompts=None, seeds=None, steps=30, cfg=5.0,
                    max_size=None, heights=None, widths=None, device="cuda",
                    prompt_template="mage-flow-edit", static_shift=None,
-                   gs_key=None,
                    vl_cond_long_edge=384,
                    renormalization=False, batch_cfg=True):
     """Edit reference image(s) per prompt. Each ``ref_images[i]`` may be a single
@@ -463,28 +443,14 @@ def generate_edits(model, prompts, ref_images, neg_prompts=None, seeds=None, ste
             raise ValueError("each edit sample needs at least one reference image")
         pils_per_sample.append([_load_pil(x) for x in refs])
 
-    # Per-sample output resolution (from the first/primary reference) + content gate.
+    # Per-sample output resolution (from the first/primary reference).
     results = [None] * n
     res_hw = [None] * n
-    active = []
-    for i in range(n):
+    active = list(range(n))
+    for i in active:
         res_hw[i] = _edit_target_size(pils_per_sample[i][0], max_size, heights[i], widths[i])
         if seeds[i] == -1:
             seeds[i] = random.randint(0, 2**32 - 1)
-        # Multimodal gate (MANDATORY): inspect the source image(s) AND the
-        # instruction, so NSFW / copyrighted-character / real-public-figure
-        # source photos are blocked even under an innocuous instruction.
-        verdict = model.txt_enc.screen_edit(prompts[i], pils_per_sample[i])
-        if verdict.violates:
-            h_, w_ = res_hw[i]
-            print(verdict.banner())
-            results[i] = make_refusal_image(verdict, height=h_, width=w_)
-            continue
-        active.append(i)
-    if not active:
-        return results
-
-    gs_key_int = resolve_gs_key(gs_key)
 
     # Per sample: reference latent tokens (clean) + target noise tokens, plus the
     # combined [target, ref_1, …, ref_N] position ids and shapes. ``target_idx``
@@ -503,8 +469,6 @@ def generate_edits(model, prompts, ref_images, neg_prompts=None, seeds=None, ste
         ref_tok = ref_tok.to(torch.bfloat16)               # [1, N*Lr, C]
         x = get_noise(num_samples=1, channel=ch, height=h_, width=w_,
                       device=dev, dtype=torch.bfloat16, seed=seeds[i])
-        x = encode_noise(tuple(x.shape[1:]), key=gs_key_int,
-                         seed=seeds[i], device=dev, dtype=torch.bfloat16)
         _, _, gh, gw = x.shape
         tgt = rearrange(x, "b c h w -> b (h w) c")          # [1, Lt, C]
         tgt_ids = torch.zeros(gh, gw, 3, device=dev)
@@ -571,65 +535,6 @@ def generate_edits(model, prompts, ref_images, neg_prompts=None, seeds=None, ste
 
 
 # ---------------------------------------------------------------------------
-# Flow-ODE inversion (Gaussian-Shading watermark detection)
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def invert_to_noise(model, z0, height, width, steps=30, device="cuda",
-                    prompt_template="mage-flow", static_shift=None, prompt=""):
-    """Reverse the flow ODE from a clean latent ``z0`` back to the initial noise.
-
-    This is the detection primitive for the Gaussian-Shading watermark: VAE-encode
-    the image to ``z0`` (posterior MEAN — deterministic), run this to recover the
-    initial noise, then read the signs via ``mage_latent.decode_bits``.
-
-    Inversion uses an empty prompt at cfg=1 (the standard Tree-Ring /
-    Gaussian-Shading setup). Reverse Euler recovers ``x_i`` from ``x_{i+1}`` with
-    the velocity evaluated at the point in hand; the sign-only watermark tolerates
-    the resulting approximation error (see the module's redundancy).
-
-    Args:
-        z0: clean latent ``[1, C, gh, gw]`` (e.g. the mean of ``model.vae.encode``).
-    Returns:
-        recovered initial-noise latent ``[1, C, gh, gw]`` (float32).
-    """
-    dev = torch.device(device)
-    info = _template_info(prompt_template)
-    template = info.get("template", "{}")
-    drop_idx = int(info.get("start_idx", 0))
-
-    z0 = z0.to(dev)
-    _, ch, gh, gw = z0.shape
-    img = rearrange(z0, "b c h w -> b (h w) c").to(torch.bfloat16)   # [1, gh*gw, C]
-
-    ids = torch.zeros(gh, gw, 3, device=dev)
-    ids[..., 1] = ids[..., 1] + torch.arange(gh, device=dev)[:, None]
-    ids[..., 2] = ids[..., 2] + torch.arange(gw, device=dev)[None, :]
-    img_ids = rearrange(ids, "h w c -> (h w) c").unsqueeze(0)
-    lens = [gh * gw]
-    img_cu = _lens_to_cu(lens, dev)
-    img_shapes = [[(1, gh, gw)]]
-
-    # Empty-prompt conditioning, no negative branch, cfg=1 (single forward).
-    txt_flat, vec_all, lens_t = _encode_texts_packed(model, [prompt], template, drop_idx, dev)
-    txt, txt_cu, txt_mask, vec = _slice_packed(txt_flat, vec_all, lens_t, 0, 1, dev)
-    ctx = _build_pack_ctx(img_ids, img_cu, img_shapes, lens, txt, txt_cu, txt_mask, vec,
-                          None, None, None, None, 1.0, False, False, dev)
-
-    scheduler = _get_scheduler(model, steps, device, static_shift)
-    sigmas = scheduler.sigmas
-    n = len(scheduler.timesteps)
-    # Forward step si: x_{si+1} = x_si + (s_{si+1}-s_si)·v(x_si, s_si).
-    # Reverse it from clean (x_n, sigma 0) up to noise (x_0), using x_{si+1} as the
-    # proxy for x_si at the forward eval sigma s_si.
-    for si in range(n - 1, -1, -1):
-        s_cur = sigmas[si].item()
-        s_next = sigmas[si + 1].item()
-        vel = _velocity(model.transformer, img, ctx, s_cur)
-        img = img - (s_next - s_cur) * vel
-    return unpack(img.float(), height, width)   # [1, C, gh, gw]
-
-
-# ---------------------------------------------------------------------------
 # High-level pipeline wrapper
 # ---------------------------------------------------------------------------
 class MageFlowPipeline:
@@ -638,10 +543,7 @@ class MageFlowPipeline:
     ``generate`` / ``edit`` are packed multi-resolution calls: they take a list
     of prompts (a single string is accepted and treated as a pack of size 1) and
     return a list of PIL images. Per-sample ``heights``/``widths``/``seeds`` are
-    lists. Every prompt is screened by the text encoder's mandatory content
-    gate (no opt-out); banned prompts come back as refusal placeholders
-    interleaved with the real images. Real outputs always carry a Gaussian-Shading
-    watermark in the initial noise (no toggle), using the configured secret key.
+    lists.
     """
 
     def __init__(self, model, device="cuda"):
@@ -670,11 +572,6 @@ class MageFlowPipeline:
         string); each ``ref_images[i]`` is one reference or a list of references."""
         kw.setdefault("device", self.device)
         return generate_edits(self.model, prompts, ref_images, **kw)
-
-    def invert_to_noise(self, z0, height, width, **kw):
-        """Recover the initial noise from a clean latent (Gaussian-Shading detect)."""
-        kw.setdefault("device", self.device)
-        return invert_to_noise(self.model, z0, height, width, **kw)
 
 
 def _safe_subpath(root: str, *parts: str) -> str:
